@@ -3,7 +3,6 @@
 static constexpr unsigned int amountOfLoopsToMeasure = 1000;
 volatile bool btnIsOn = false;
 
-// Hardware Timing Variables
 unsigned long lastMicros = 0;
 unsigned long microsSum = 0;
 unsigned int timerIteration = 0;
@@ -27,7 +26,6 @@ struct LedConfig
   static constexpr unsigned long intervalLed = 500; // In milliseconds
 };
 
-// Declared volatile because they are modified inside the ISR
 volatile LedConfig::LedState currentLedState = LedConfig::LedState::ON;
 volatile LedConfig::LedMode currentLedMode = LedConfig::LedMode::FLASHING;
 
@@ -106,13 +104,12 @@ public:
 Led redLed = Led(LedConfig::LedPin);
 Btn btn = Btn(ButtonConfig::BtnPin);
 
-// Interrupt Handler with Debouncing
+
 void changeState()
 {
   static unsigned long lastInterruptTime = 0;
   unsigned long currentMillis = millis();
 
-  // Filter out contact bounces within 200 ms
   if (currentMillis - lastInterruptTime > ButtonConfig::debounceTime)
   {
     btnIsOn = !btnIsOn;
