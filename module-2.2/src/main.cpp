@@ -3,9 +3,13 @@
 struct RelayConfig {
   static constexpr int relayControlPin = 5;
   static constexpr int relayFeedbackPin = 18;
-  
+  static constexpr bool activeLow = false;
+
   static constexpr unsigned long testInterval = 1000;
-  static constexpr unsigned long debounceMicros = 500;
+  static constexpr unsigned long settleMicros = 5000;
+  static constexpr unsigned long timeoutMicros = 100000;
+  static constexpr unsigned int measurementsRequired = 10;
+  static constexpr int maxErrors = 5;
 
   enum State {
     OFF = LOW,
@@ -13,26 +17,34 @@ struct RelayConfig {
   };
 };
 
-volatile unsigned long lastInterruptTime = 0;
-volatile unsigned long activationTimeMicros = 0;
-volatile bool feedbackTriggered = false;
+portMUX_TYPE feedbackMux = portMUX_INITIALIZER_UNLOCKED;
+
+volatile bool feedbackArmed = false;
+volatile unsigned long firstEdgeMicros = 0;
+volatile unsigned long lastEdgeMicros = 0;
+volatile unsigned long edgeCount = 0;
 
 unsigned long testStartMicros = 0;
-unsigned int measurementCount = 0;
-unsigned long totalDelaySum = 0;
-
-bool isMeasuringOn = true;
+unsigned int onCount = 0;
+unsigned int offCount = 0;
+unsigned long onDelaySum = 0;
+unsigned long offDelaySum = 0;
+unsigned long onBounceSum = 0;
+unsigned long offBounceSum = 0;
+int errorCount = 0;
 
 void IRAM_ATTR handleRelayFeedback() {
   unsigned long currentMicros = micros();
-  
-  if ((currentMicros - lastInterruptTime) > RelayConfig::debounceMicros) {
-    if (!feedbackTriggered) {
-      activationTimeMicros = currentMicros;
-      feedbackTriggered = true;
+
+  portENTER_CRITICAL_ISR(&feedbackMux);
+  if (feedbackArmed) {
+    if (edgeCount == 0) {
+      firstEdgeMicros = currentMicros;
     }
-    lastInterruptTime = currentMicros;
+    lastEdgeMicros = currentMicros;
+    edgeCount++;
   }
+  portEXIT_CRITICAL_ISR(&feedbackMux);
 }
 
 class RelayMeasurement {
@@ -46,14 +58,19 @@ public:
   void init() {
     pinMode(controlPin, OUTPUT);
     pinMode(feedbackPin, INPUT_PULLUP);
-    digitalWrite(controlPin, currentState);
+    set(currentState);
 
     attachInterrupt(digitalPinToInterrupt(feedbackPin), handleRelayFeedback, CHANGE);
   }
 
   void set(RelayConfig::State state) {
     currentState = state;
-    digitalWrite(controlPin, state);
+    bool level = (state == RelayConfig::State::ON) != RelayConfig::activeLow;
+    digitalWrite(controlPin, level ? HIGH : LOW);
+  }
+
+  RelayConfig::State readContact() {
+    return digitalRead(feedbackPin) == LOW ? RelayConfig::State::ON : RelayConfig::State::OFF;
   }
 };
 
@@ -69,6 +86,33 @@ RelayMeasurement relay(RelayConfig::relayControlPin, RelayConfig::relayFeedbackP
 
 unsigned long lastTestMillis = 0;
 bool testActive = false;
+bool testFinished = false;
+
+void armFeedback(bool armed) {
+  portENTER_CRITICAL(&feedbackMux);
+  if (armed) {
+    edgeCount = 0;
+  }
+  feedbackArmed = armed;
+  portEXIT_CRITICAL(&feedbackMux);
+}
+
+void handleError() {
+  relay.set(relay.readContact());
+  errorCount++;
+
+  if (errorCount >= RelayConfig::maxErrors) {
+    Serial.println("Забагато помилок підряд, вимірювання зупинено");
+    relay.set(RelayConfig::State::OFF);
+    testFinished = true;
+  }
+}
+
+void printAverage(const char *stateName, unsigned long delaySum, unsigned long bounceSum, unsigned int count) {
+  unsigned long averageDelay = delaySum / count;
+  Serial.printf(">>> СЕРЕДНІЙ час %s реле: %lu мкс (%.2f мс), брязкіт %lu мкс\n",
+                stateName, averageDelay, averageDelay / 1000.0, bounceSum / count);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -78,48 +122,78 @@ void setup() {
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
-
-  if (noBlockingDelay(currentMillis, lastTestMillis, RelayConfig::testInterval) && !testActive) {
-    feedbackTriggered = false;
-    testActive = true;
-    
-    if (isMeasuringOn) {
-      testStartMicros = micros();
-      relay.set(RelayConfig::State::ON);
-    } else {
-      testStartMicros = micros();
-      relay.set(RelayConfig::State::OFF);
-    }
+  if (testFinished) {
+    return;
   }
 
-  if (testActive && feedbackTriggered) {
-    unsigned long mechanicalDelay = activationTimeMicros - testStartMicros;
-    
-    measurementCount++;
-    totalDelaySum += mechanicalDelay;
+  unsigned long currentMillis = millis();
 
-    if (isMeasuringOn) {
-      Serial.printf("Вимірювання %d (УВІМКНЕННЯ): %lu мкс\n", measurementCount, mechanicalDelay);
-    } else {
-      Serial.printf("Вимірювання %d (ВИМКНЕННЯ): %lu мкс\n", measurementCount, mechanicalDelay);
-    }
+  if (!testActive && noBlockingDelay(currentMillis, lastTestMillis, RelayConfig::testInterval)) {
+    RelayConfig::State nextState = (relay.currentState == RelayConfig::State::ON)
+                                       ? RelayConfig::State::OFF
+                                       : RelayConfig::State::ON;
+    armFeedback(true);
+    testActive = true;
+    testStartMicros = micros();
+    relay.set(nextState);
+  }
 
+  if (!testActive) {
+    return;
+  }
+
+  portENTER_CRITICAL(&feedbackMux);
+  unsigned long firstEdge = firstEdgeMicros;
+  unsigned long lastEdge = lastEdgeMicros;
+  unsigned long edges = edgeCount;
+  portEXIT_CRITICAL(&feedbackMux);
+  unsigned long currentMicros = micros();
+
+  bool isMeasuringOn = (relay.currentState == RelayConfig::State::ON);
+  const char *stateName = isMeasuringOn ? "УВІМКНЕННЯ" : "ВИМКНЕННЯ";
+
+  if ((currentMicros - testStartMicros) > RelayConfig::timeoutMicros) {
+    armFeedback(false);
     testActive = false;
+    Serial.printf("Помилка (%s): немає відповіді контакту, фронтів: %lu\n", stateName, edges);
+    handleError();
+    return;
+  }
 
-    if (measurementCount >= 10) {
-      unsigned long averageDelay = totalDelaySum / 10;
-      if (isMeasuringOn) {
-        Serial.printf(">>> СЕРЕДНІЙ час УВІМКНЕННЯ реле: %lu мкс (%.2f мс)\n\n", averageDelay, averageDelay / 1000.0);
-        isMeasuringOn = false;
-      } else {
-        Serial.printf(">>> СЕРЕДНІЙ час ВИМКНЕННЯ реле: %lu мкс (%.2f мс)\n\n", averageDelay, averageDelay / 1000.0);
-        isMeasuringOn = true;
-      }
-      
-      measurementCount = 0;
-      totalDelaySum = 0;
-      delay(2000);
-    }
+  if (edges == 0 || (currentMicros - lastEdge) < RelayConfig::settleMicros) {
+    return;
+  }
+
+  armFeedback(false);
+  testActive = false;
+
+  if (relay.readContact() != relay.currentState) {
+    Serial.printf("Помилка (%s): кінцевий стан контакту не відповідає очікуваному\n", stateName);
+    handleError();
+    return;
+  }
+
+  errorCount = 0;
+  unsigned long mechanicalDelay = firstEdge - testStartMicros;
+  unsigned long bounceTime = lastEdge - firstEdge;
+
+  if (isMeasuringOn && onCount < RelayConfig::measurementsRequired) {
+    onCount++;
+    onDelaySum += mechanicalDelay;
+    onBounceSum += bounceTime;
+    Serial.printf("Вимірювання %u (УВІМКНЕННЯ): %lu мкс, брязкіт %lu мкс\n", onCount, mechanicalDelay, bounceTime);
+  } else if (!isMeasuringOn && offCount < RelayConfig::measurementsRequired) {
+    offCount++;
+    offDelaySum += mechanicalDelay;
+    offBounceSum += bounceTime;
+    Serial.printf("Вимірювання %u (ВИМКНЕННЯ): %lu мкс, брязкіт %lu мкс\n", offCount, mechanicalDelay, bounceTime);
+  }
+
+  if (onCount >= RelayConfig::measurementsRequired && offCount >= RelayConfig::measurementsRequired) {
+    Serial.println();
+    printAverage("УВІМКНЕННЯ", onDelaySum, onBounceSum, onCount);
+    printAverage("ВИМКНЕННЯ", offDelaySum, offBounceSum, offCount);
+    relay.set(RelayConfig::State::OFF);
+    testFinished = true;
   }
 }
