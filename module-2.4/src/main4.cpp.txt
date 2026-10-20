@@ -1,0 +1,101 @@
+
+#include <Arduino.h>
+
+struct ButtonConfig {
+  static constexpr int buttonPin = 4;
+  static constexpr unsigned long pollIntervalMs = 5;
+  static constexpr unsigned long debounceMs = 20;
+
+  enum State {
+    RELEASED,
+    PRESS_DEBOUNCE,
+    PRESSED,
+    RELEASE_DEBOUNCE
+  };
+};
+
+bool noBlockingDelay(unsigned long currentMillis, unsigned long &previousMillis, unsigned long interval) {
+  if ((currentMillis - previousMillis) >= interval) {
+    previousMillis = currentMillis;
+    return true;
+  }
+  return false;
+}
+
+class PolledButton {
+public:
+  int pin;
+  ButtonConfig::State state;
+  unsigned long stateEnterMillis;
+  unsigned long pressCount;
+
+  PolledButton(int p)
+      : pin(p), state(ButtonConfig::State::RELEASED), stateEnterMillis(0), pressCount(0) {}
+
+  void init() {
+    pinMode(pin, INPUT_PULLUP);
+  }
+
+  void update(unsigned long currentMillis) {
+    bool isLow = (digitalRead(pin) == LOW);
+    bool stableEnough = (currentMillis - stateEnterMillis) >= ButtonConfig::debounceMs;
+
+    switch (state) {
+      case ButtonConfig::State::RELEASED:
+        if (isLow) {
+          changeState(ButtonConfig::State::PRESS_DEBOUNCE, currentMillis);
+        }
+        break;
+
+      case ButtonConfig::State::PRESS_DEBOUNCE:
+        if (!isLow) {
+          changeState(ButtonConfig::State::RELEASED, currentMillis);
+        } else if (stableEnough) {
+          changeState(ButtonConfig::State::PRESSED, currentMillis);
+          pressCount++;
+          Serial.printf("Натискання %lu\n", pressCount);
+        }
+        break;
+
+      case ButtonConfig::State::PRESSED:
+        if (!isLow) {
+          changeState(ButtonConfig::State::RELEASE_DEBOUNCE, currentMillis);
+        }
+        break;
+
+      case ButtonConfig::State::RELEASE_DEBOUNCE:
+        if (isLow) {
+          changeState(ButtonConfig::State::PRESSED, currentMillis);
+        } else if (stableEnough) {
+          changeState(ButtonConfig::State::RELEASED, currentMillis);
+          Serial.println("Відпущено");
+        }
+        break;
+    }
+  }
+
+private:
+  void changeState(ButtonConfig::State newState, unsigned long currentMillis) {
+    state = newState;
+    stateEnterMillis = currentMillis;
+  }
+};
+
+PolledButton button(ButtonConfig::buttonPin);
+
+unsigned long lastPollMillis = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  button.init();
+  Serial.println("\n--- Завдання 4: опитування + машина станів ---");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (noBlockingDelay(currentMillis, lastPollMillis, ButtonConfig::pollIntervalMs)) {
+    button.update(currentMillis);
+  }
+}

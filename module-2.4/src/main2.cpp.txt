@@ -1,0 +1,59 @@
+#include <Arduino.h>
+
+struct ButtonConfig {
+  static constexpr int buttonPin = 4;
+  static constexpr unsigned long debounceMs = 50;
+};
+
+volatile unsigned long rawInterruptCount = 0;
+volatile bool buttonEventFlag = false;
+
+void IRAM_ATTR handleButtonInterrupt() {
+  rawInterruptCount++;
+  buttonEventFlag = true;
+}
+
+class TimeDebouncedButton {
+public:
+  int pin;
+  unsigned long lastAcceptedMillis;
+  unsigned long acceptedCount;
+
+  TimeDebouncedButton(int p) : pin(p), lastAcceptedMillis(0), acceptedCount(0) {}
+
+  void init() {
+    pinMode(pin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(pin), handleButtonInterrupt, FALLING);
+  }
+
+  void update(unsigned long currentMillis) {
+    if (!buttonEventFlag) {
+      return;
+    }
+    buttonEventFlag = false;
+
+    if ((currentMillis - lastAcceptedMillis) < ButtonConfig::debounceMs) {
+      return;
+    }
+
+    lastAcceptedMillis = currentMillis;
+    acceptedCount++;
+
+    bool pressed = (digitalRead(pin) == LOW);
+    Serial.printf("Спрацювання %lu (сирих переривань: %lu), кнопка %s\n",
+                  acceptedCount, rawInterruptCount, pressed ? "натиснута" : "відпущена");
+  }
+};
+
+TimeDebouncedButton button(ButtonConfig::buttonPin);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  button.init();
+  Serial.println("\n--- Завдання 2: антидребезг за часом (50 мс) ---");
+}
+
+void loop() {
+  button.update(millis());
+}
